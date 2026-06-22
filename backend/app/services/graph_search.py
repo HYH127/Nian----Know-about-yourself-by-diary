@@ -8,14 +8,17 @@ import aiosqlite
 import structlog
 
 from app.database import get_connection
-from app.services.vector_store import vector_store
 
 logger = structlog.get_logger()
 
 # 实体名称匹配缓存: (pages_list, timestamp)
-# TTL 5 分钟，避免每次对话都从向量库全量加载
+# TTL 5 分钟，避免每次对话都全量加载
 _entities_cache: tuple[list[dict], float] = ([], 0)
 _ENTITIES_CACHE_TTL = 300  # 5 分钟
+
+# 实体 embedding 缓存: (embeddings_map, timestamp)
+# 与 _entities_cache 同步过期
+_embeddings_cache: tuple[dict[str, list[float]], float] = ({}, 0)
 
 
 def _placeholders(n: int) -> str:
@@ -149,8 +152,8 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 async def _load_entity_pages() -> list[dict]:
     """加载所有非 system 类型的实体页面（带内存缓存，TTL 5 分钟）。
 
-    从向量库加载，比每次查 SQLite 全量 pages 表更快。
-    返回字段：slug, title, type, summary, compiled_truth_preview, aliases_list, updated_at
+    从 SQLite 加载，包含完整 compiled_truth。
+    返回字段：slug, title, type, summary, compiled_truth, aliases_list, updated_at
     """
     global _entities_cache
     pages, ts = _entities_cache
@@ -158,26 +161,31 @@ async def _load_entity_pages() -> list[dict]:
         return pages
 
     try:
-        rows = await vector_store.load_all_entities()
-        pages: list[dict] = []
-        for row in rows:
-            try:
-                aliases_list = json.loads(row.get("aliases") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                aliases_list = []
-            pages.append({
-                "slug": row.get("slug", ""),
-                "title": row.get("title", ""),
-                "type": row.get("type", "concept"),
-                "summary": row.get("summary", ""),
-                "compiled_truth": row.get("compiled_truth_preview", ""),  # 前 300 字，用于展示
-                "aliases_list": aliases_list,
-                "updated_at": row.get("updated_at", ""),
-            })
-        _entities_cache = (pages, time.time())
-        return pages
+        async with get_connection() as db:
+            cursor = await db.execute(
+                "SELECT slug, title, type, summary, compiled_truth, aliases, updated_at "
+                "FROM pages WHERE type != 'system'"
+            )
+            rows = await cursor.fetchall()
+            pages = []
+            for row in rows:
+                try:
+                    aliases_list = json.loads(row["aliases"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    aliases_list = []
+                pages.append({
+                    "slug": row["slug"],
+                    "title": row["title"],
+                    "type": row["type"],
+                    "summary": row["summary"] or "",
+                    "compiled_truth": row["compiled_truth"] or "",
+                    "aliases_list": aliases_list,
+                    "updated_at": row["updated_at"] or "",
+                })
+            _entities_cache = (pages, time.time())
+            return pages
     except Exception:
-        logger.exception("load_entity_pages_from_vector_failed")
+        logger.exception("load_entity_pages_failed")
         return []
 
 
@@ -241,11 +249,38 @@ def _name_match_pages(text: str, pages: list[dict]) -> list[dict]:
 
 
 async def _compute_page_embeddings(pages: list[dict]) -> dict[str, list[float]]:
-    """已废弃：实体 embedding 现在存储在向量库中，不再需要实时计算。
+    """批量计算实体页面的 embedding，带缓存。
 
-    保留空实现以避免外部调用报错（实际上已无调用方）。
+    embedding 文本 = title + summary（摘要比全文更精准，且 token 更少）。
     """
-    return {}
+    global _embeddings_cache
+    emb_map, ts = _embeddings_cache
+    # 缓存与 _entities_cache 同步过期
+    if emb_map and time.time() - ts < _ENTITIES_CACHE_TTL:
+        return emb_map
+
+    from app.utils.embedding import embed_texts
+
+    emb_map = {}
+    if not pages:
+        return emb_map
+
+    # 构造 embedding 文本
+    texts = []
+    for p in pages:
+        title = (p.get("title") or "").strip()
+        summary = (p.get("summary") or "").strip()
+        texts.append(f"{title} {summary}".strip())
+
+    try:
+        vectors = await embed_texts(texts)
+        for p, vec in zip(pages, vectors):
+            emb_map[p["slug"]] = vec
+        _embeddings_cache = (emb_map, time.time())
+    except Exception:
+        logger.exception("compute_page_embeddings_failed")
+
+    return emb_map
 
 
 async def detect_entity_hits(text: str, query_vector: list[float] = None) -> list[dict]:
@@ -253,8 +288,6 @@ async def detect_entity_hits(text: str, query_vector: list[float] = None) -> lis
 
     返回命中实体列表，每项含 slug/title/type/summary/compiled_truth/hit_type/score。
     query_vector: 预计算的 query embedding（可选，避免重复调用 embedding API）。
-
-    语义检索改为使用向量库预计算的 embedding，不再实时调用 embedding API。
     """
     if not text or not text.strip():
         return []
@@ -267,37 +300,31 @@ async def detect_entity_hits(text: str, query_vector: list[float] = None) -> lis
         name_matched = _name_match_pages(text, pages)
         name_slugs = {p["slug"] for p in name_matched}
 
-        # b. 语义检索（使用向量库，0 次 embedding API 调用）
+        # b. 语义检索（实时计算 embedding + 余弦相似度）
         semantic_hits: list[tuple[float, dict]] = []
-        if query_vector is not None:
-            try:
-                results = await vector_store.search_entities(query_vector, limit=20)
-            except Exception:
-                logger.exception("vector_search_entities_failed")
-                results = []
+        try:
+            from app.utils.embedding import embed_texts
 
-            # 构建 slug -> page 的映射，用于关联向量检索结果与页面元数据
-            page_by_slug = {p["slug"]: p for p in pages}
+            if query_vector is None:
+                query_vector = (await embed_texts([text]))[0]
+
+            page_embeddings = await _compute_page_embeddings(pages)
 
             scored: list[tuple[float, dict]] = []
-            for r in results:
-                slug = r.get("slug", "")
-                if slug not in page_by_slug:
+            for p in pages:
+                if p["slug"] in name_slugs:
                     continue
-                # LanceDB _distance 转相似度
-                distance = r.get("_distance", 1.0)
-                similarity = 1.0 / (1.0 + float(distance)) if distance >= 0 else 0.0
-                if similarity >= 0.5:
-                    scored.append((similarity, page_by_slug[slug]))
+                vec = page_embeddings.get(p["slug"])
+                if vec is None:
+                    continue
+                sim = _cosine_similarity(query_vector, vec)
+                if sim >= 0.5:
+                    scored.append((sim, p))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            # 去重：跳过已通过名称匹配的实体
-            for score, page in scored:
-                if page["slug"] in name_slugs:
-                    continue
-                semantic_hits.append((score, page))
-                if len(semantic_hits) >= 5:
-                    break
+            semantic_hits = scored[:5]
+        except Exception:
+            logger.exception("semantic_entity_search_failed")
 
         # 合并结果（名称匹配在前，score=1.0）
         results: list[dict] = []

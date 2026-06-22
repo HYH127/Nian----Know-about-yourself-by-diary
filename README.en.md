@@ -16,7 +16,7 @@
 
 ## What is NianNian?
 
-NianNian is a **Personal Digital Twin Agent** — an LLM-powered memory and conversation system that builds a deep understanding of who you are. It ingests your diaries, chat logs, consumption records, and media consumption data to construct a persistent personality profile, knowledge graph, and long-term memory, enabling an AI that genuinely "knows" you.
+NianNian is a **Personal Digital Twin Agent** — an LLM-powered memory and conversation system that builds a deep understanding of who you are. It ingests your diaries to construct a persistent personality profile, knowledge graph, and long-term memory, enabling an AI that genuinely "knows" you.
 
 Unlike general-purpose AI assistants that treat every conversation as a blank slate, NianNian **gets better the more you use it** — it remembers your habits, preferences, relationships, emotional patterns, and even surfaces changes you might not notice yourself.
 
@@ -87,24 +87,16 @@ Supported entity types: people, places, habits, emotional patterns, value signal
 
 ### Data Import
 
-NianNian can ingest multiple external data sources to build a more complete memory:
+NianNian ingests data through diaries. Each diary entry automatically extracts events, signals, and knowledge to build your memory:
 
 | Source | Method | Extracted Content |
 |--------|--------|-------------------|
-| WeChat | Structured import | Interaction frequency, sentiment, reply patterns, topic distribution, language style |
-| Alipay | CSV file import | Spending patterns, category preferences, merchant habits, consumption trends |
-| Books/Films/Music | Structured import | Genre preferences, rating distribution, consumption frequency, emotional correlation |
-| Social Media | Structured import | Social interaction, content preferences, posting frequency |
-
-WeChat import supports **three privacy tiers** (Tier1: stats only / Tier2: content analysis / Tier3: deep analysis). Tier2 data is encrypted with Fernet, and Tier3 data auto-expires after 24 hours.
+| Diary | Manual entry / Structured import | Timeline events, entities, signals, emotional patterns, knowledge pages |
 
 ### Dashboard Visualizations
 
-Rich visualization API endpoints:
+Emotion visualization API endpoint:
 
-- **Life River**: Timeline visualization of important life events
-- **Relation Nebula**: Character relationship network visualization
-- **Habit Tide**: Temporal trends of habit formation and fading
 - **Emotion Season**: Time-series analysis of emotional changes
 
 ---
@@ -164,7 +156,6 @@ Rich visualization API endpoints:
 │  · Diaries / Timeline Events  │  · Knowledge page vectors      │
 │  · Knowledge Pages / Links    │  · Timeline event vectors      │
 │  · Portrait Records / Changes │  · Entity vectors              │
-│  · WeChat / Alipay / Media    │  · Snapshot cache              │
 ├──────────────────────────────────────────────────────────────┤
 │  External Services                                             │
 │  · DeepSeek V4 (LLM)                                          │

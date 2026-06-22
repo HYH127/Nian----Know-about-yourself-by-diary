@@ -1,0 +1,382 @@
+一、项目概览
+GBrain 是一个个人知识库系统，由 Y Combinator 创始人 Garry Tan 开发并维护。当前版本 v0.8.0，采用 MIT 许可证。
+
+核心定位
+为 AI Agent 提供持久化、可检索、可更新的个人知识层。它的核心理念可以用一句话概括：
+
+AI Agent 很聪明，但对你一无所知。GBrain 让 Agent 通过读写结构化的知识库，在每次对话中变得更聪明。
+技术栈
+组件	技术
+运行时	Bun
+语言	TypeScript
+本地 DB	PGLite(Postgres 17.5 WASM)
+远程 DB	Postgres + pgvector + pg_trgm
+向量模型	OpenAI text-embedding-3-large(1536 维)
+LLM	Anthropic Claude(Haiku 用于扩展/分块)
+前端协议	MCP(stdio + HTTP)
+存储	S3/Supabase Storage/本地文件系统
+真实生产数据
+Garry Tan 本人的大脑部署规模：
+
+10,000+Markdown 文件
+3,000+ 人物页面（带完整档案）
+13 年日历数据
+280+ 会议转录记录
+300+ 捕获的原始想法
+二、核心设计理念
+“Thin Harness, Fat Skills”
+这是 GBrain 最重要的架构哲学：
+
+GBrain CLI = 薄层（Thin Harness）：提供确定性的、可复用的基础操作（CRUD、搜索、链接、标签等）。相同输入必然产生相同输出。
+Skills = 厚层（Fat Skills）：以 Markdown 文件编写的 AI Agent 指令集，告诉 Agent 何时和如何使用这些工具。
+Recipes = 安装程序：同样是 Markdown 文件，描述了如何安装各种数据集成（语音、邮件、Twitter、日历等）。
+这种设计的巧妙之处在于：“Markdown 就是代码”。集成逻辑不是写在二进制里，而是写在可读可编辑的 Markdown 文件中。Agent 阅读这些文件，向用户索要 API 密钥，自动完成配置。
+
+三个核心原则
+原则	含义
+Compiled Truth + Timeline	每个知识页面上方是”当前最佳理解”(可重写)，下方是”只追加证据链”(永不编辑)
+Contract-First	operations.ts 是 CLI、MCP、Library 的唯一真理源，所有接口从中生成
+Code for Data, LLMs for Judgment	确定性代码负责收集数据，AI 负责判断和解读
+三、架构总览
+
+
+
+
+
+架构图展示了 GBrain 的 五层架构：
+
+第一层：数据源（Data Sources）
+四个并行的信息入口：
+
+数据源	技术	产出
+Git 仓库	Markdown 文件	人物、概念、会议笔记
+语音通话	Twilio + OpenAI Realtime	通话转录 → 知识页面
+邮件/日历	Gmail + Google Calendar	邮件实体 → 页面更新
+Twitter/会议	X API + Circleback	推文监测 + 会议转录
+第二层：导入流水线（Import Pipeline）
+五步数据处理链：
+
+文件解析 → 内容哈希 → 分块 → 嵌入 → 数据库事务
+(gray-matter)  (SHA-256)  (3策略)  (text-embed-3)  (原子写入)
+三种分块策略：
+
+策略	适用场景	原理
+递归分块	时间线、批量导入	5 级分隔符层次，300 词 chunk，50 词重叠
+语义分块	compiled truth	嵌入句子 + 余弦相似度 + Savitzky-Golay 平滑
+LLM 引导	高价值内容	Claude Haiku 识别主题转移
+第三层：存储引擎（Storage Engine）
+两种可互换的数据库引擎，支持双向迁移：
+
+引擎	技术	适用场景	成本
+PGLite (默认)	Postgres 17.5 → WASM	本地使用，零配置，2 秒启动	免费
+Postgres	Supabase / 自托管	大规模 1000+ 文件、多设备、远程 MCP	25 美元/月
+核心数据表（10 张）：
+
+表名	用途
+pages	核心内容(slug、类型、编译真相、时间线、JSONB frontmatter)
+content_chunks	分块内容 + 1536 维向量嵌入(HNSW 索引)
+links	页面间的类型化关系(knows、works_at、invested_in)
+tags	多对多标签
+timeline_entries	结构化时间线事件
+page_versions	页面版本快照(支持 diff/revert)
+raw_data	外部 API 原始数据(JSONB 侧车存储)
+files	二进制附件
+ingest_log	导入审计日志
+config	大脑级配置
+第四层：搜索引擎（Search Engine）
+七步搜索流水线：
+
+Query → 多查询扩展 → 向量搜索 → 关键词搜索 → RRF 融合 → 4层去重 → Top N
+        (Claude)     (HNSW)      (tsvector)    (Σ1/(60+rank))  (Jaccard)
+第五层：接口层（Interface Layer）
+三种访问方式：
+
+接口	用途	工具数
+CLI	命令行操作	~30 个命令
+MCP Server	AI Agent 调用	30 个工具
+TypeScript Library	代码集成	BrainEngine 接口
+四、知识模型
+“Compiled Truth + Timeline” 模式
+这是 GBrain 最核心的数据组织方式。每个知识页面（Page）分为两部分：
+
+---
+type: concept
+title: Do Things That Don't Scale
+tags: [startups, growth, pg-essay]
+---
+
+# Compiled Truth（编译后的真相）
+Paul Graham's argument that startups should do unscalable things early on...
+（你的当前最佳理解，可以随时重写）
+
+---
+
+# Timeline（时间线）
+- 2013-07-01: Published on paulgraham.com
+- 2024-11-15: Referenced in batch W25 kickoff talk
+（只追加的证据链，永不编辑）
+核心逻辑：
+
+Compiled Truth：当前最佳理解，可以被重写
+Timeline：只追加的证据链，记录来源和时间
+页面类型（9 种）
+person、company、deal、yc、civic、project、concept、source、media
+
+推荐目录结构
+brain/
+├── people/          # 人物页面
+├── companies/       # 公司信息
+├── concepts/        # 概念与想法
+├── meetings/        # 会议记录
+├── ideas/           # 原始创意
+├── deals/           # 交易/项目
+└── sources/         # 信息来源
+五、搜索引擎
+混合搜索（Hybrid Search）
+GBrain 的搜索是项目最核心的技术亮点之一。
+
+为什么需要混合搜索？
+搜索方式	优势	盲区
+纯关键词	精确匹配短语	错过概念匹配：”ignore conventional wisdom” 找不到 “The Bus Ticket Theory of Genius”
+纯向量	语义相似匹配	嵌入被周围文本稀释时错过精确短语
+RRF 融合	两者兼顾	需要调优参数
+搜索流水线详解
+用户查询
+  ↓
+多查询扩展（Claude Haiku 生成 2 个替代表述）
+  ↓
+  ├── 向量搜索（pgvector HNSW，余弦距离）→ 2x limit 结果
+  └── 关键词搜索（PostgreSQL tsvector + ts_rank）→ 2x limit 结果
+  ↓
+RRF 融合：score = Σ(1/(60 + rank))
+  ↓
+4 层去重：
+  1. 每页保留最佳 chunk（来源去重）
+  2. Jaccard 相似度 > 0.85（文本去重）
+  3. 类型多样性（单类型不超过 60%）
+  4. 每页最多 2 个 chunk（页面封顶）
+  ↓
+Top N 结果（默认 20）
+RRF（Reciprocal Rank Fusion） 是信息检索领域的经典算法，将不同来源的排名列表融合成一个统一排名。公式 score = 1/(60 + rank) 中，k=60 是经验常数，确保高排名结果权重更大。
+
+优雅降级
+没有 OpenAI API Key 时，搜索自动降级为纯关键词搜索，不会崩溃。这是一个非常务实的设计。
+
+索引策略
+索引类型	字段	用途
+B-tree	slug、type	精确查找
+GIN	frontmatter、search_vector	全文搜索
+HNSW	embeddings	余弦相似度向量搜索
+pg_trgm	title	模糊 slug 解析
+六、可插拔引擎架构
+BrainEngine 接口
+export interface BrainEngine {
+  // 生命周期
+  connect(config: EngineConfig): Promise<void>;
+  disconnect(): Promise<void>;
+  initSchema(): Promise<void>;
+  transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+
+  // 页面 CRUD
+  getPage(slug: string): Promise<Page | null>;
+  putPage(slug: string, page: PageInput): Promise<Page>;
+  deletePage(slug: string): Promise<void>;
+  listPages(filters?: PageFilters): Promise<Page[]>;
+
+  // 搜索
+  searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
+  searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]>;
+
+  // 分块、链接、标签、时间线、版本...
+  // 共 37 个方法
+}
+关键实现细节
+两种引擎使用相同的 SQL：PGLite 运行的是真正的 Postgres，不是独立方言
+动态导入：createEngine() 根据配置动态加载，PGLite WASM 不会被 Postgres 用户加载
+事务隔离：使用 Object.create 创建事务作用域，避免共享状态污染
+双向迁移：gbrain migrate --to supabase/pglite 可在两种引擎间迁移，嵌入直接复制无需重新生成
+七、数据流水线
+完整流程
+输入（Markdown 文件、Git 仓库）
+  ↓
+文件解析（gray-matter 提取 frontmatter + body）
+  ↓
+内容哈希（SHA-256，不变的文件跳过）
+  ↓
+分块（3 种策略，按内容类型分发）
+  ↓
+嵌入生成（OpenAI text-embedding-3-large，1536 维）
+  ↓
+数据库事务（原子操作：page + chunks + tags + version）
+  ↓
+搜索立即可用
+关键设计
+幂等导入：基于 SHA-256 内容哈希，重复导入自动跳过未变文件
+Git 增量同步：通过 manifest 跟踪变更，只处理修改过的文件
+批量嵌入：100 条一批，指数退避重试
+PGLite 串行导入：PGLite 单连接架构，使用顺序导入而非并行
+八、Skills 与 Recipes
+Skills：使用说明书
+告诉 AI Agent “有了大脑之后怎么用”：
+
+Skill	功能
+ingest	导入会议、文档、文章。更新编译真相(重写，不追加)，追加时间线，创建交叉引用
+query	3 层搜索(关键词 + 向量 + 结构化) + 合成 + 引用。不知道就说”大脑没有这个信息”
+maintain	定期检查：矛盾、过时的编译真相、孤儿页面、死链接、标签不一致、缺失嵌入
+enrich	从外部 API 丰富页面。原始数据分开存储，提炼后的高亮进入编译真相
+briefing	每日简报：今天的会议 + 参与者上下文、活跃交易、敏感话题、最近变更
+migrate	从 Obsidian/Notion/Logseq 迁移(wikilinks 转 gbrain 链接、剥离 UUID 等)
+setup	从零设置 GBrain：自动配置 Supabase、导入、同步
+Recipes：安装说明书
+告诉 AI Agent “怎么给大脑装新器官”：
+
+Recipe	功能	依赖	成本
+Voice-to-Brain	打电话给 AI，通话自动生成知识页面	ngrok-tunnel	15-25 美元/月
+Email-to-Brain	Gmail 自动导入为知识页面	credential-gateway	免费
+X-to-Brain	监控 Twitter 时间线、提及、关键词	无	0-200 美元/月
+Calendar-to-Brain	Google 日历自动同步为可搜索页面	credential-gateway	免费
+Meeting Sync	Circleback 会议转录自动导入	无	0-17 美元/月
+Credential Gateway	Gmail + 日历的 OAuth 认证网关	无	免费
+Public Tunnel	ngrok 固定 URL，用于 MCP 和语音	无	8 美元/月
+安装过程
+用户不需要自己看文档操作。用户只需要告诉 AI Agent：”安装 Voice-to-Brain”，Agent 会：
+
+读取 Recipe 文件
+向用户索要密钥（明确告诉用户去哪里找）
+验证密钥（运行健康检查命令）
+按顺序配置每个组件
+冒烟测试（实际调用一次，验证端到端正常）
+九、MCP 集成
+GBrain 通过 MCP（Model Context Protocol）提供 30 个工具，可从任何 AI Agent 调用：
+
+模式	用途	客户端
+stdio	本地调用	Claude Code、Cursor、Windsurf
+HTTP + ngrok	远程访问	Claude Desktop、Perplexity
+所有 MCP 工具从同一份 operations.ts 自动生成，确保 CLI 和 MCP 的一致性。项目中有专门的 parity 测试验证结构一致性。
+
+工具列表（30 个）
+类别	工具
+页面 CRUD	get_page、put_page、delete_page、list_pages
+搜索	search、query
+标签	add_tag、remove_tag、get_tags
+链接	add_link、remove_link、get_links、get_backlinks、traverse_graph
+时间线	add_timeline_entry、get_timeline
+管理	get_stats、get_health、get_versions、revert_version
+同步	sync_brain
+原始数据	put_raw_data、get_raw_data
+解析/分块	resolve_slugs、get_chunks
+导入日志	log_ingest、get_ingest_log
+文件	file_list、file_upload、file_url
+十、代码质量分析
+优点
+Contract-first 设计：operations.ts 是唯一真理源，CLI、MCP、tools-json 全部从中生成
+类型安全：完整的 TypeScript 类型定义，BrainEngine 接口明确（37 个方法）
+测试覆盖：23 个单元测试 + 4 个 E2E 测试，PGLite 引擎有专门的全面测试（20KB+）
+优雅降级：没有 API Key 时功能降级而非崩溃
+幂等操作：导入、同步都是幂等的，可安全重试
+事务安全：使用 Object.create 创建事务作用域，避免共享状态污染
+文档完善：CLAUDE.md 为 Agent 提供完整的开发指南
+社区协作：规范的 PR 处理流程（collector branch 模式），尊重贡献者
+SHA 锁定：GitHub Actions 全部使用 commit SHA 固定版本
+潜在问题
+PGLite 的 WASM 性能：虽然是真正的 Postgres，但 WASM 层的性能开销在大规模数据下可能成为瓶颈
+文件存储 TODO：file_url 操作中仍有 TODO 注释（生成 signed URL 未实现）
+语音集成复杂性：v0.8.0 引入的 25 个生产模式意味着维护成本较高
+Supabase 依赖：虽然支持 PGLite，但大规模场景仍依赖 Supabase Pro(25 美元/月)
+模型依赖：需要前沿模型（Claude Opus 4.6、GPT-5.4 Thinking），小模型容易出问题
+十一、典型使用场景
+1. 个人知识管理
+维护人物、公司、概念的知识库，支持语义搜索。回答诸如”我上次和张三聊了什么？”、”关于分布式系统我写过什么？”等问题。
+
+2. 会议准备
+会前自动生成参与者档案、共同历史、未决话题。”Prep me for my meeting with Jordan in 30 minutes”——拉取档案、共享历史、最近活动、未决话题。
+
+3. 社交图谱
+跨 3000+ 人物页面进行社交关系交叉引用。”Who should I invite to dinner who knows both Pedro and Diana?”
+
+4. 创意管理
+追踪原创想法的演变历史，包括原创性检测、深度测试、交叉链接。
+
+5. AI Agent 记忆
+为 OpenClaw、Hermes 等 Agent 提供长期知识层。与 Agent 短期记忆（偏好、决策）互补。
+
+6. 语音助手
+通过电话号码或 WebRTC 提供具备上下文感知的语音 AI。”Her” 体验，开箱即用。
+
+十二、实践指南
+快速开始
+# 1. 安装
+bun add -g github:garrytan/gbrain
+
+# 2. 初始化（PGLite，零配置，2 秒启动）
+gbrain init
+
+# 3. 验证
+gbrain doctor
+
+# 4. 导入现有笔记
+gbrain import /path/to/your/notes --no-embed
+
+# 5. 查看统计
+gbrain stats
+启用向量搜索
+# 设置 API Key
+export OPENAI_API_KEY=sk-...
+
+# 生成嵌入（约 1 分钟/1000 页）
+gbrain embed --stale
+
+# 体验混合搜索
+gbrain query "你笔记中的核心主题是什么？"
+实际投入估算
+阶段	时间	成本	产出
+安装验证	5 分钟	免费	可用的本地大脑
+导入笔记	10-30 分钟	免费	基础知识库
+启用向量搜索	5 分钟	4-5 美元(7500 页)	语义搜索能力
+配置 Agent 集成	30-60 分钟	取决于 Agent	Agent 可读写大脑
+建立自动同步	15 分钟	免费(cron)	知识库自动更新
+存储估算（~7500 页面参考）
+组件	大小
+页面文本	~150 MB
+JSONB + 索引	~70 MB
+Content Chunks(~22K)	~80 MB
+Embeddings(22K × 1536 维)	~134 MB
+HNSW 索引开销	~270 MB
+链接/标签/时间线/版本	~50 MB
+总计	~750 MB
+常见陷阱
+过度设计目录结构：先导入，再根据实际使用情况调整。GBrain 支持模糊 slug 匹配，不必一开始就追求完美。
+没有建立写入习惯：知识库不会自己增长。每次对话后，让 Agent 更新相关页面。
+忽视时间线：时间线是知识的”证据链”。没有它，你无法追溯某个结论是怎么得出的。
+用太小的模型：GBrain 明确要求前沿模型。小模型无法正确理解 Skills 指令，容易出错。
+十三、项目评价
+亮点
+独特的”Markdown 即代码”理念：用可读的 Markdown 文件替代传统配置代码
+务实的默认值：PGLite 零配置启动，2 秒可用
+信息检索领域的最佳实践：RRF 融合、多查询扩展、4 层去重
+优秀的开发者体验：完善的 CLAUDE.md、测试指南、E2E 生命周期管理
+真实的生产验证：Garry Tan 本人的 10000+ 文件、3000+ 人物页面的真实部署
+核心价值主张
+GBrain 的真正价值不在于搜索，而在于知识复利效应：
+
+你和某人开了一次会。Agent 为他们写了一个大脑页面，链接到他们的公司，标记了交易。下周有人在不同的语境中提到那家公司。Agent 已经有了完整的画面：你和谁谈过、讨论了什么、有哪些未决话题。你什么都没做。大脑已经有了。
+值得关注
+这是一个个人工具，目标用户是拥有 AI Agent 的技术人员
+需要前沿模型才能保证 Agent 正确理解和使用 Skills
+核心价值在于复利效应：使用越久，知识积累越多，价值越大
+附录：关键命令速查
+命令	功能
+gbrain init	创建大脑(PGLite 默认，或 Supabase)
+gbrain doctor	健康检查(pgvector、RLS、schema、embeddings)
+gbrain import <dir>	导入 Markdown 目录(幂等)
+gbrain sync	Git 到 Brain 增量同步
+gbrain search <query>	关键词搜索
+gbrain query <question>	混合搜索(向量 + 关键词 + RRF)
+gbrain get <slug>	读取页面
+gbrain put <slug>	写入/更新页面
+gbrain embed --stale	生成/刷新嵌入
+gbrain stats	统计信息
+gbrain health	健康仪表盘
+gbrain migrate --to supabase	迁移到 Supabase
+gbrain serve	MCP 服务器
+gbrain integrations list	查看可用集成

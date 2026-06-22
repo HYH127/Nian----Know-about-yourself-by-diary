@@ -1,0 +1,442 @@
+以下是融合了所有讨论内容的**总开发文档**，结构完整，可直接交付给 AI 编程助手进行 Vibe Coding。
+
+---
+
+# 念念·GBrain 融合系统开发文档 (v2.0)
+
+## 1. 项目概述与核心原则
+
+### 1.1 项目名称
+**念念 (NianNian)** —— 双循环个人知识生命体
+
+### 1.2 核心定位
+一个通过客观行为痕迹构建动态用户画像，并用结构化知识库持久化“编译真相”的个人 AI 系统。它融合了：
+- **念念** 的实时情境感知与画像推断能力
+- **GBrain** 的 `Compiled Truth + Timeline` 知识库范式
+- **LLM Wiki** 的异步编译与交叉引用思想
+
+### 1.3 核心原则 (AI 必须遵守)
+- **Thin Harness, Fat Skills**：后端只提供原子工具（CRUD、搜索、嵌入、文件读写），所有复杂流程由 `skills/` 目录下的 Markdown 文件定义，LLM 在运行时阅读并执行。
+- **Compiled Truth + Timeline**：每个知识页面由“可重写的当前最佳理解”和“只追加的证据链”组成。
+- **双循环架构**：外循环（慢）负责编译知识、维护 Wiki；内循环（快）负责实时个性化对话。两个循环通过“信号队列”连接。
+- **Contract-First**：API 和 CLI 从同一份接口定义生成，确保一致性。
+- **Python + FastAPI** 为主，轻量级依赖，适合教学和快速迭代。
+
+---
+
+## 2. 系统架构总览
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      用户接口层 (WebUI)                    │
+│                  - 聊天窗口  - 知识库浏览器                │
+└──────────┬───────────────────────────────┬───────────────┘
+           │                               │
+┌──────────▼──────────┐       ┌───────────▼───────────────┐
+│  内循环实时引擎      │       │   外循环编译引擎           │
+│  - 情境检测          │       │  - 任务调度器 (定时/阈值)  │
+│  - 导航式 RAG        │       │  - LLM 深度编译           │
+│  - 流式对话生成      │       │  - 交叉引用与反向链接维护  │
+│  - 信号提取并记录    │       │  - Lint 健康检查           │
+└──┬──────────┬───────┘       └──┬────────────┬───────────┘
+   │          │                  │            │
+   │          ▼                  │            │
+   │  ┌──────────────┐           │            │
+   │  │ 信号与行为记录 │◄──────────┼────────────┘
+   │  │ (raw_signals) │           │
+   │  └──────┬───────┘           │
+   │         │                   │
+   ▼         ▼                   ▼
+┌──────────────────────────────────────────────────────────┐
+│                   混合知识库层 (GBrain 化)                 │
+│  - 文件系统 Wiki (`brain/` 目录下 Markdown 页面)         │
+│  - SQLite 数据库 (pages, chunks, links, tags, versions)  │
+│  - 向量引擎 (sqlite-vec)                                 │
+│  - 混合搜索 (RRF 融合 + 多层去重)                        │
+└──────────────────────────────────────────────────────────┘
+```
+
+**关键数据流**：
+1. **内循环**：用户消息 → 情境检测 → 读取知识库结构化页面 → 生成个性化回复 → 对话结束后提取原始信号 → 存入 `raw_signals` 表 (status="unprocessed")。
+2. **外循环**：调度器发现某实体关联的未处理信号 ≥ 3 → 触发编译 → LLM 读取旧页面 + 新信号 + Tavily 搜索（可选） → 重写 `Compiled Truth`，追加 `Timeline` → 更新反向链接 → 信号标记为 "processed"。
+
+---
+
+## 3. 环境配置
+
+### 3.1 最低硬件要求
+- **内存**: 2GB
+- **磁盘**: 5GB
+- **网络**: 可访问阿里云百炼 API 和 Tavily API
+
+### 3.2 软件依赖
+- Python 3.10+
+- SQLite 3.35+ (支持 FTS5)
+- 包管理：pip 或 uv
+
+### 3.3 环境变量 (完整清单)
+```bash
+# 阿里云百炼 (DashScope)
+export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"    # 从百炼控制台获取
+export LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export LLM_CHAT_MODEL="qwen-plus"                 # 主力对话模型
+export LLM_MINI_MODEL="qwen-turbo"               # 轻量任务 (情境检测、信号提取)
+export LLM_EMBEDDING_MODEL="text-embedding-v4"    # 嵌入模型, 1024维
+export LLM_EMBEDDING_DIMENSIONS=1024
+
+# Tavily 联网搜索 (仅外循环使用)
+export TAVILY_API_KEY="tvly-xxxxxxxxxxxxxxxx"
+
+# 数据库 (默认使用 SQLite)
+export DATABASE_URL="sqlite:///brain.db"
+
+# 知识库路径
+export BRAIN_PATH="./brain"
+
+# 服务
+export PORT=8000
+```
+
+### 3.4 Python 依赖安装
+```bash
+pip install fastapi uvicorn[standard] typer python-frontmatter aiosqlite \
+            openai tavily-python sqlite-vec sse-starlette streamlit markdown jinja2
+```
+
+### 3.5 验证命令
+```bash
+python -c "import sqlite3; print('SQLite:', sqlite3.sqlite_version)"
+python -c "import openai; print('OpenAI SDK OK')"
+python -c "import tavily; print('Tavily SDK OK')"
+```
+
+---
+
+## 4. 分阶段功能需求与验收标准
+
+### 第一阶段：混合知识库与导入管线
+**目标**：实现 `Compiled Truth + Timeline` 页面结构，支持 Markdown 导入和混合搜索。
+
+#### 用户故事
+- 我可以将本地 Markdown 笔记导入，系统自动解析并建立可搜索的知识库。
+- 我可以用关键词或自然语言搜索，得到精准、去重的结果。
+- 我可以查看任何页面的编译真相和时间线。
+
+#### 详细需求
+1. **数据库初始化 (`gbrain init`)**
+   - 创建 SQLite 数据库，包含表：
+     - `pages`: slug, type, title, frontmatter(JSON), compiled_truth, timeline(JSON array)
+     - `content_chunks`: page_id, chunk_text, embedding(1024维向量), chunk_index
+     - `links`: source_page_id, target_page_id, link_type
+     - `tags`: page_id, tag
+     - `page_versions`: page_id, version, compiled_truth_snapshot, timeline_snapshot
+     - `ingest_log`: file_path, sha256, status
+     - `raw_signals`: signal_json, entity_tags(JSON), status('unprocessed'/'processed')
+   - 创建 FTS5 虚拟表关联 `pages.compiled_truth`。
+
+2. **导入 Markdown (`gbrain import <dir>`)**
+   - 扫描 `.md` 文件，用 `python-frontmatter` 解析。
+   - 计算文件 SHA-256，跳过未变更文件 (幂等)。
+   - 按 `---` 分割正文为 `compiled_truth` 和 `timeline` (若只有一个部分则视为 `compiled_truth`)。
+   - 对 `compiled_truth` 递归分块 (300词/块, 50词重叠)，生成向量并存入 `content_chunks`。
+   - 支持 `--no-embed` 跳过向量生成。
+
+3. **混合搜索 (`gbrain search <query>`)**
+   - 可选：用轻量 LLM 扩展查询 (后期开启)。
+   - 并行执行 FTS5 关键词搜索与向量余弦相似度搜索。
+   - RRF 融合：`score = 1/(60 + rank)`。
+   - 4层去重：每页最佳 chunk → Jaccard 去重 (>0.85) → 类型多样性 (单类 ≤60%) → 每页最多2 chunk。
+   - 返回前 20 条，含 slug、标题、片段、得分。
+
+4. **CLI 工具**
+   - `gbrain.py` 使用 `typer` 实现。
+
+#### 验收标准
+- [ ] 导入 10 个测试文件，`pages` 表填充正确，`ingest_log` 记录哈希。
+- [ ] 重复导入相同目录，所有文件被跳过 (幂等)。
+- [ ] 关键词搜索命中预期文件。
+- [ ] 向量搜索找到概念相关文件 (语义相似)。
+- [ ] RRF 结果兼顾关键词和语义相关项。
+
+---
+
+### 第二阶段：信号与行为记录器
+**目标**：从文本中提取行为信号，存入队列供外循环使用。
+
+#### 用户故事
+- 系统能从对话/日记中提取消费、决策、情绪等信号，并存储为原始记录。
+
+#### 详细需求
+1. **信号提取工具 `tool_extract_signals`**
+   - 正则通道：消费金额、决策词、情绪词等。
+   - LLM 通道：调用 `qwen-turbo` 提取复杂信号。
+   - 统一输出 JSON：`{type, sub_type, content, evidence, source_type, source_id}`。
+   - 按 `type:sub_type:evidence` 去重合并。
+
+2. **信号存储**
+   - 写入 `raw_signals` 表，状态默认 `unprocessed`。
+   - `entity_tags` 由简单 NER 或 LLM 从 content 提取。
+
+3. **Skill 文件**
+   - `skills/skill_extract_and_log_signals.md`：指导 LLM 何时及如何使用工具。
+
+#### 验收标准
+- [ ] 输入“花了500元”，正则通道提取消费信号。
+- [ ] 输入“纠结要不要辞职”，LLM 通道提取 `decision/hesitation`。
+- [ ] 双通道结果无重复，成功存入数据库且状态为 `unprocessed`。
+
+---
+
+### 第三阶段：内循环实时引擎
+**目标**：实现情境感知流式对话，依赖第一阶段的结构化知识库。
+
+#### 用户故事
+- 聊天时念念能引用知识库中的具体历史和个人特质，给出有共情力的个性化回复。
+- 对话结束后自动记录行为信号。
+
+#### 详细需求
+1. **情境检测工具 `tool_detect_context`**
+   - 用 `qwen-turbo` 输出 JSON：`{primary_context, entities, emotion}`。
+   - 上下文类型：`family, work, decision, social, media, default`。
+
+2. **导航式 RAG 工具**
+   - `tool_navigate_index(entities, context)`：读取 `brain/index.md` 和 `brain/system/chat_log.md`，返回相关 slug 列表。
+   - `tool_fetch_compiled_context(slugs)`：读取这些页面的 `compiled_truth` 和最近5条 `timeline`，拼接上下文。
+
+3. **流式对话 `POST /chat`**
+   - 接收 `{session_id, message}`。
+   - 流程：保存消息 → 情境检测 → 导航检索 → 构建系统提示词 → 流式 LLM 调用 (SSE) → 保存回复 → 异步调用信号提取 Skill。
+   - System Prompt 模板：注入编译上下文，要求引用证据、语言自然。
+
+4. **前端原型**
+   - 用 Streamlit 或简单 HTML/JS 展示流式聊天。
+
+#### 验收标准
+- [ ] 当知识库有“与父亲争吵”页面时，回复能引用具体历史。
+- [ ] 对话后 `raw_signals` 新增信号，状态 `unprocessed`。
+- [ ] 无关领域不编造信息。
+
+---
+
+### 第四阶段：外循环编译引擎 + Skill Creator
+**目标**：后台异步编译知识，并让系统能自己创建新 Skill。
+
+#### 用户故事
+- 系统自动将累积信号转化为更新的知识页面和交叉引用。
+- 当需要新自动化流程时，系统可建议并创建一个新 Skill。
+
+#### 详细需求
+1. **任务调度器**
+   - 每5分钟轮询 `raw_signals`，对同一 `entity_tag` 的 `unprocessed` 信号 ≥3 时触发编译。
+
+2. **编译原子工具**
+   - `tool_get_page_by_slug`, `tool_save_page_version`, `tool_update_page` (原子更新+信号状态变更)。
+   - `tool_web_search(query)`: 通过 Tavily 补充客观信息。
+
+3. **编译 Skill**
+   - `skills/skill_compile_entity.md`：步骤：读页面 → 读信号 → 分析/搜索 → 重写 Compiled Truth → 追加 Timeline → 保存版本 → 更新信号状态。
+   - `skills/skill_maintain_backlinks.md`：维护交叉引用。
+
+4. **Skill Creator (元能力)**
+   - **触发**：重复性操作 ≥3 次或用户显式要求。
+   - **流程**：需求收集 → 生成草稿 → 沙箱验证 → 用户确认 → 写入 `skills/` 并注册。
+   - **新增 Harness 工具**：`tool_list_existing_skills`, `tool_file_write(skills/)`, `tool_register_skill`, `tool_dry_run_skill`。
+   - **元 Skill**：`skills/skill_create_skill.md` 指导 LLM 如何写 Skill。
+
+5. **Lint 健康检查 (`gbrain lint`)**
+   - 全库分析，生成报告：矛盾、过时信息、孤立页面、建议。
+
+#### 验收标准
+- [ ] 实体累积3信号后编译任务触发，页面更新，版本快照保存，信号状态变为 `processed`。
+- [ ] 反向链接自动更新。
+- [ ] 用户说“以后自动整理周报”，系统生成新 Skill 草稿，确认后生效。
+
+---
+
+### 第五阶段：全链路集成与主动交互
+**目标**：闭环完成，系统能主动推送变化简报，Wiki 浏览器可用。
+
+#### 用户故事
+- 登录时念念主动告知：“你不在时我整理了你关于 XX 的思考，发现了一些变化”。
+- 我能在浏览器中查看完整的知识库页面和交叉链接。
+
+#### 详细需求
+1. **主动问候**：`GET /greeting` 检查近24小时编译任务，返回变化简报。
+2. **Wiki 浏览器**：`/wiki/{slug}` 渲染 Markdown，支持 `[[wikilinks]]` 导航，显示 compiled_truth 和 timeline。
+3. **全链路 E2E 测试**：模拟对话 → 信号记录 → 编译 → 页面更新 → 主动问候。
+
+#### 验收标准
+- [ ] 夜间编译后次日收到主动问候。
+- [ ] Wiki 浏览器可浏览、跳转。
+- [ ] E2E 测试全部通过。
+
+---
+
+## 5. 技术规范与约定
+
+### 5.1 数据库 Schema (SQLite)
+```sql
+CREATE TABLE pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT UNIQUE NOT NULL,
+    type TEXT DEFAULT 'concept',
+    title TEXT NOT NULL,
+    frontmatter TEXT DEFAULT '{}',
+    compiled_truth TEXT,
+    timeline TEXT DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE VIRTUAL TABLE pages_fts USING fts5(slug, title, compiled_truth, content='pages');
+
+CREATE TABLE content_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+    chunk_text TEXT NOT NULL,
+    embedding BLOB,   -- 存储1024维float32序列化
+    chunk_index INTEGER
+);
+
+CREATE TABLE links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_page_id INTEGER REFERENCES pages(id),
+    target_page_id INTEGER REFERENCES pages(id),
+    link_type TEXT
+);
+
+CREATE TABLE tags (
+    page_id INTEGER REFERENCES pages(id),
+    tag TEXT
+);
+
+CREATE TABLE page_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER REFERENCES pages(id),
+    version_number INTEGER,
+    compiled_truth_snapshot TEXT,
+    timeline_snapshot TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE ingest_log (
+    file_path TEXT PRIMARY KEY,
+    sha256 TEXT,
+    status TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE raw_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_json TEXT NOT NULL,
+    entity_tags TEXT DEFAULT '[]',
+    status TEXT DEFAULT 'unprocessed',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 5.2 API 端点
+- `POST /chat` - 流式对话 (SSE)
+- `GET /page/{slug}` - 获取页面 JSON
+- `PUT /page/{slug}` - 更新页面 (供 Skills 调用)
+- `GET /search?q=&mode=hybrid` - 搜索
+- `POST /ingest` - 触发目录导入
+- `GET /greeting` - 主动问候
+- `GET /health` - 系统状态
+- `GET /wiki/{slug}` - 渲染 Markdown 页面 (HTML)
+
+### 5.3 Skill 文件规范
+- 所有 Skill 放在 `skills/` 目录，Markdown 格式。
+- 内容必须包含：触发条件、所需工具、步骤编号列表、输出格式。
+- 系统启动时扫描 `skills/` 目录，建立触发词索引。
+
+---
+
+## 6. Wiki 文件系统与 GBrain CLI 使用说明
+
+### 6.1 知识库目录结构 (brain/)
+```
+brain/
+├── index.md              # 全局索引
+├── system/
+│   ├── chat_log.md       # 对话日志
+│   └── change_brief.md   # 最新变化简报
+├── self/
+│   ├── traits.md         # 人格特质
+│   └── patterns.md       # 行为模式
+├── people/
+│   └── 父亲.md
+├── concepts/
+│   └── 职业倦怠.md
+├── media/
+│   └── 三体.md
+├── meetings/
+└── sources/
+```
+
+### 6.2 页面格式 (示例: `brain/people/父亲.md`)
+```markdown
+---
+type: person
+title: 父亲
+tags: [家庭, 重要人物]
+---
+
+# Compiled Truth
+
+父亲是一个传统且关心子女的人...（当前最佳理解，可重写）
+
+---
+
+# Timeline
+
+- **2026-01-15**：深度沟通... [来源: 日记/2026-01-15]
+- **2026-03-20**：因工作争吵... [来源: 对话/session_abc]
+```
+
+### 6.3 CLI 命令速查
+```bash
+gbrain init                     # 初始化大脑
+gbrain import <dir> [--no-embed]  # 导入 Markdown
+gbrain get <slug>               # 查看页面
+gbrain search "<query>"         # 搜索
+gbrain compile [--entity X]     # 触发编译
+gbrain lint                     # 健康检查
+gbrain stats                    # 数据库统计
+gbrain serve [--port 8000]      # 启动 MCP/HTTP 服务
+```
+
+---
+
+## 7. 全链路闭环测试用例 (端到端)
+
+**剧本**：从聊天到编译再到主动问候，完整跑通双循环。
+
+1. **初始化**：`gbrain init`，导入包含 `self/traits.md` 和 `people/父亲.md` 的测试知识库。
+2. **第一天对话**：用户发送“又和老爸吵架了”，系统回复并提取信号存入 `raw_signals`。
+3. **写日记**：导入一篇关于反思的日记，产生新信号。
+4. **夜间编译**：调度器检测到“父亲”实体信号 ≥3，触发编译。
+   - 更新 `父亲.md` 的 Compiled Truth 和 Timeline。
+   - 同步更新 `traits.md` 的反向链接。
+   - 信号状态变为 `processed`。
+5. **次日登录**：`GET /greeting` 返回变化简报，用户可点击查看更新后的页面。
+6. **Wiki 验证**：访问 `/wiki/people/父亲` 显示完整页面，链接可跳转。
+
+**自动化测试**：编写脚本模拟上述流程，断言数据库状态和 API 返回。
+
+---
+
+## 8. 给 AI 编程助手的开发指令
+
+请严格按分阶段顺序实现，每一阶段都需通过验收标准后再进入下一阶段。代码风格：
+
+- **Thin Harness**：工具函数纯净、无副作用，签名明确。
+- **Fat Skills**：多步骤流程写在 Markdown 中，不要硬编码在 Python 内。
+- **文档化**：每个模块、工具函数需有清晰 docstring。
+- **可测试**：核心逻辑编写单元测试。
+
+**立即开始**：  
+“请从第一阶段开始，实现数据库初始化和 Markdown 导入功能，并提供 CLI 接口。完成后我会进行验证，然后进入下一阶段。”
+
+---
+

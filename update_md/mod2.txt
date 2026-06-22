@@ -1,0 +1,206 @@
+一、项目定位与核心价值
+念念·GBrain 是一个个人 AI 双循环知识生命体，核心理念是：
+
+通过客观行为痕迹构建动态用户画像，并用结构化知识库持久化"编译真相"
+
+它融合了三个关键思想：
+
+念念的实时情境感知
+GBrain的 Compiled Truth + Timeline 知识范式
+LLM Wiki的异步编译思想
+二、系统整体架构
+
+Plain Text
+
+┌─────────────────────────────────────────────────────────────┐
+│                      双循环架构                              │
+├──────────────────────┬──────────────────────────────────────┤
+│      内循环          │              外循环                   │
+│   (实时响应)         │          (异步编译)                   │
+├──────────────────────┼──────────────────────────────────────┤
+│  ① 情境检测          │  ① 信号积累                          │
+│  ② 导航式 RAG        │  ② 触发编译 (≥3信号)                 │
+│  ③ 流式对话          │  ③ 重写 Compiled Truth               │
+│  ④ 自动提取信号      │  ④ 追加 Timeline                     │
+└──────────────────────┴──────────────────────────────────────┘
+三、知识库设计（核心亮点）
+3.1 数据库 Schema 设计
+我们使用 SQLite 作为存储层，设计了以下核心表：
+
+
+SQL
+
+-- 核心页面表：存储 Compiled Truth + Timeline
+pages (
+    id, slug, type, title,
+    compiled_truth,    -- 当前最佳理解（可重写）
+    timeline,          -- 证据链（只追加）
+    created_at, updated_at
+)
+
+-- 内容块表：用于向量检索
+content_chunks (
+    id, page_id, chunk_text, embedding, chunk_index
+)
+
+-- 链接表：支持 WikiLinks 双向链接
+links (source_page_id, target_page_id, link_type)
+
+-- 版本快照表：支持历史回溯
+page_versions (page_id, version_number, compiled_truth_snapshot, timeline_snapshot)
+
+-- 原始信号表：记录用户行为痕迹
+raw_signals (signal_json, entity_tags, status)
+3.2 Compiled Truth + Timeline 模式
+这是知识库最核心的设计创新：
+
+维度	Compiled Truth	Timeline
+性质	当前最佳理解	客观证据链
+操作	可重写	只追加
+作用	快速获取认知	追溯演变过程
+类比	Wikipedia 词条	Git 提交历史
+Markdown 文件格式示例：
+
+
+Markdown
+
+---
+type: people
+title: 张三
+tags: [朋友, 同事]
+---
+
+# Compiled Truth
+
+张三是我大学同学，目前在字节跳动工作...
+
+---
+
+## Timeline
+
+- 2024-01-15: 一起吃饭，聊到他想换工作 [来源: 日记/2024-01-15]
+- 2024-03-20: 他说拿到了腾讯 offer [来源: 聊天记录]
+- 2024-05-10: 最终决定留在字节 [来源: 对话记录]
+四、混合搜索实现（技术亮点）
+4.1 双通道检索 + RRF 融合
+
+Python
+
+async def hybrid_search(query: str, limit: int = 20) -> list[dict]:
+    # 并行执行两种搜索
+    fts_results, vector_results = await asyncio.gather(
+        search_fts(db, query, limit=limit * 2),      # FTS5 全文搜索
+        _vector_search(db, query, limit=limit * 2),   # 向量相似度搜索
+    )
+    
+    # RRF (Reciprocal Rank Fusion) 融合
+    fused = _rrf_fusion(fts_results, vector_results, k=60)
+    
+    # 4层去重策略
+    return _deduplicate(fused)[:limit]
+4.2 四层去重策略
+Slug 去重：同一页面只保留最佳 chunk
+Jaccard 相似度去重：相似度 > 0.85 的文本块去重
+类型比例控制：单一类型不超过总数的 60%
+Slug 频次控制：每个 slug 最多出现 2 次
+为什么用 RRF？
+
+FTS 擅长精确匹配关键词
+向量搜索擅长语义相似
+RRF 公式 score = 1/(k+rank) 无需调参，对两种检索方式公平
+五、时间线实现机制
+5.1 信号提取（双通道）
+
+Python
+
+async def tool_extract_signals(text: str) -> list[dict]:
+    # 通道1：正则快速提取（消费、决策、情绪、冲突）
+    regex_signals = extract_signals_regex(text)
+    
+    # 通道2：LLM 深度提取（决策犹豫、价值观、人际关系等）
+    llm_signals = await extract_signals_llm(text)
+    
+    # 去重合并
+    return deduplicate_signals(regex_signals + llm_signals)
+信号类型设计：
+
+expense - 消费行为
+decision - 决策（made/hesitation）
+emotion - 情绪（positive/negative）
+relationship - 人际关系变化
+goal - 目标设定
+reflection - 自我反思
+5.2 外循环编译流程
+
+Plain Text
+
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  信号积累   │───→│  触发条件   │───→│  编译执行   │
+│  (raw_     │    │  ≥3个未处理  │    │  LLM重写    │
+│   signals)  │    │  信号       │    │  Compiled   │
+└─────────────┘    └─────────────┘    │  Truth      │
+                                      └──────┬──────┘
+                                             ↓
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  反向链接   │←───│  版本快照   │←───│  Timeline   │
+│  维护       │    │  保存       │    │  追加       │
+└─────────────┘    └─────────────┘    └─────────────┘
+编译触发条件：
+
+每 5 分钟轮询一次
+同一实体积累 ≥3 个未处理信号时触发
+使用 LLM 重写 Compiled Truth，同时追加 Timeline
+六、内循环对话引擎
+6.1 情境感知流程
+
+Python
+
+async def chat_stream(session_id: str, message: str, history: list):
+    # Step 1: 情境检测（提取实体 + 判断场景类型）
+    ctx = await tool_detect_context(message)
+    entities = ctx.get("entities", [])
+    context_type = ctx.get("primary_context", "default")
+    
+    # Step 2: 导航式 RAG（根据情境路由到不同知识目录）
+    slugs = await tool_navigate_index(entities, context_type)
+    
+    # Step 3: 获取 Compiled Truth + 最近 Timeline
+    compiled_context = await tool_fetch_compiled_context(slugs)
+    
+    # Step 4: 流式对话生成
+    stream = client.chat.completions.create(...)
+    
+    # Step 5: 异步提取信号（不阻塞对话）
+    asyncio.create_task(extract_and_log_signals(...))
+6.2 情境路由映射
+
+Python
+
+CONTEXT_DIR_MAP = {
+    "family": ["people"],           # 家庭话题 → 人物目录
+    "work": ["meetings"],           # 工作话题 → 会议记录
+    "decision": ["self", "concepts"], # 决策话题 → 自我/概念
+    "social": ["people"],           # 社交话题 → 人物
+    "learning": ["concepts", "sources"], # 学习话题 → 概念/来源
+}
+七、技术选型与参考思路
+技术点	选型	参考思路
+存储	SQLite + FTS5	轻量、嵌入式、无需部署
+向量	阿里云 text-embedding-v4	1024维，中文效果好
+LLM	阿里云 qwen-plus	国内 API 稳定
+搜索融合	RRF	经典信息检索融合算法
+架构	Thin Harness + Fat Skills	核心逻辑放在可插拔 Skill
+知识范式	Compiled Truth + Timeline	参考 Andy Matuschak 的 Evergreen Notes
+WikiLinks	[[slug]] 语法	参考 Obsidian/Roam Research
+八、项目成果与测试
+✅ 全链路 E2E 测试：对话 → 信号提取 → 编译 → 页面更新
+✅ 混合搜索准确率：FTS + 向量 + RRF 融合
+✅ 版本控制：每次编译自动保存快照
+✅ 幂等导入：基于 SHA256 跳过未变更文件
+✅ Streamlit 前端：聊天窗口 + Wiki 浏览器
+九、面试可强调的产品思维
+渐进式认知：Compiled Truth 可以被"纠正"，Timeline 保留原始证据
+隐私优先：本地 SQLite，数据不上云
+可解释性：每个认知都有 Timeline 证据链支撑
+双向链接：WikiLinks 构建知识网络，支持图谱可视化
+元能力设计：Skill Creator 让用户自定义自动化规则
